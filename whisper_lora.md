@@ -1,0 +1,1 @@
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/xiaofanpaiooo-code/whisper-lora/blob/xiaofanpaiooo-code-patch-1/whisper_lora.ipynb）
