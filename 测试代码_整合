@@ -1,0 +1,170 @@
+# ==============================================================================
+# 毕业设计核心代码：基于 LoRA 的 Whisper 语音识别微调系统 (最终修正版)
+# 适用环境：Google Colab (T4 GPU)
+# 作者：Gemini 协作完成
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 第一步：环境配置 (运行后请重启会话)
+# ------------------------------------------------------------------------------
+# 1. 卸载可能冲突的库，锁定 datasets 版本以解决 torchcodec 解码报错
+!pip uninstall -y datasets
+!pip install -q datasets==2.21.0
+!pip install -q transformers peft accelerate evaluate jiwer librosa soundfile bitsandbytes
+
+print("✅ 依赖安装完毕！请点击菜单栏 '代码执行程序' -> '重启会话'，然后继续运行。")
+
+# ------------------------------------------------------------------------------
+# 第二步：核心库导入与环境检查
+# ------------------------------------------------------------------------------
+import torch
+import os
+import random
+from datasets import load_dataset, Audio
+from transformers import (
+    WhisperProcessor, 
+    WhisperForConditionalGeneration, 
+    Seq2SeqTrainingArguments, 
+    Seq2SeqTrainer
+)
+from peft import LoraConfig, get_peft_model
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+# 确保 GPU 已开启
+if not torch.cuda.is_available():
+    print("❌ 警告：未检测到 GPU，训练将极其缓慢！请检查运行时设置。")
+else:
+    print(f"✅ GPU 就绪: {torch.cuda.get_device_name(0)}")
+
+# ------------------------------------------------------------------------------
+# 第三步：数据加载 (使用公开无门槛的 Minds14 数据集)
+# ------------------------------------------------------------------------------
+model_id = "openai/whisper-small" # 毕设推荐使用 small 模型
+processor = WhisperProcessor.from_pretrained(model_id, language="Chinese", task="transcribe")
+
+print("正在加载数据集 (polyai/minds14 中文子集)...")
+# 关闭 streaming 模式以避免由于数据量不足导致的 ValueError
+dataset = load_dataset("polyai/minds14", "zh-CN", split="train", streaming=False)
+
+def prepare_dataset(batch):
+    audio = batch["audio"]
+    # 提取 Log-Mel 特征
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], 
+        sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+    # Minds14 文本字段名为 'transcription'
+    batch["labels"] = processor.tokenizer(batch["transcription"]).input_ids
+    return batch
+
+# 强制重采样到 16kHz 并映射预处理
+dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+dataset = dataset.map(prepare_dataset, num_proc=1)
+
+print(f"✅ 数据准备完毕，共计 {len(dataset)} 条样本。")
+
+# ------------------------------------------------------------------------------
+# 第四步：数据整理器 (Data Collator)
+# ------------------------------------------------------------------------------
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # 填充音频输入
+        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        # 填充文本标签
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        # 将 padding 的部分设为 -100 以在 Loss 计算中忽略
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        
+        # 剔除首位的 bos 标记 (Whisper 的标准做法)
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+# ------------------------------------------------------------------------------
+# 第五步：注入 LoRA 旁路矩阵 (核心算法)
+# ------------------------------------------------------------------------------
+print("正在加载 Whisper 并挂载 LoRA 适配器...")
+model = WhisperForConditionalGeneration.from_pretrained(model_id)
+
+# 显存优化：启用梯度检查点
+model.config.use_cache = False 
+model.gradient_checkpointing_enable()
+
+# LoRA 配置：只针对 Query 和 Value 投影层进行低秩自适应
+config = LoraConfig(
+    r=8,              # 秩，决定了矩阵的宽度
+    lora_alpha=32,    # 缩放因子
+    target_modules=["q_proj", "v_proj"], 
+    lora_dropout=0.05,
+    bias="none"
+)
+
+model = get_peft_model(model, config)
+# 打印可训练参数占比（论文中的关键数据指标）
+model.print_trainable_parameters()
+
+# ------------------------------------------------------------------------------
+# 第六步：设置训练参数并启动
+# ------------------------------------------------------------------------------
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./whisper-lora-final-result",
+    per_device_train_batch_size=8,        
+    gradient_accumulation_steps=1,
+    learning_rate=1e-3,                   # LoRA 通常需要较大的学习率
+    warmup_steps=10,
+    max_steps=50,                         # 演示设为 50，实际微调建议设为 500-1000
+    fp16=True,                            # T4 GPU 必须开启半精度以加速
+    logging_steps=10,
+    save_steps=25,
+    remove_unused_columns=False,
+    label_names=["labels"],
+    report_to=["tensorboard"],
+    processing_class=processor.feature_extractor, # 规避旧版弃用警告
+)
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,
+    train_dataset=dataset,
+    data_collator=data_collator,
+)
+
+print("🚀 训练开始...")
+trainer.train()
+
+# ------------------------------------------------------------------------------
+# 第七步：结果保存与可视化验证
+# ------------------------------------------------------------------------------
+# 1. 保存权重
+save_path = "final_bishe_lora_model"
+model.save_pretrained(save_path)
+print(f"💾 权重已保存至: {save_path}")
+
+# 2. 推理测试对比
+print("\n📊 随机样本验证结果:")
+model.eval()
+test_sample = random.choice(list(dataset))
+input_features = torch.tensor(test_sample["input_features"]).unsqueeze(0).cuda()
+
+with torch.no_grad():
+    generated_ids = model.generate(input_features, language="Chinese")
+
+pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+real_text = processor.decode(test_sample["labels"], skip_special_tokens=True)
+
+print("-" * 30)
+print(f"真实标签: {real_text}")
+print(f"LoRA预测: {pred_text}")
+print("-" * 30)
